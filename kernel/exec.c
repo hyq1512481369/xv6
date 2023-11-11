@@ -41,6 +41,8 @@ int exec(char *path, char **argv) {
     if (ph.vaddr + ph.memsz < ph.vaddr) goto bad;
     uint64 sz1;
     if ((sz1 = uvmalloc(pagetable, sz, ph.vaddr + ph.memsz)) == 0) goto bad;
+    if (sz1 >= PLIC) goto bad;
+    //不满足要求的情况处理
     sz = sz1;
     if (ph.vaddr % PGSIZE != 0) goto bad;
     if (loadseg(pagetable, ph.vaddr, ip, ph.off, ph.filesz) < 0) goto bad;
@@ -92,11 +94,16 @@ int exec(char *path, char **argv) {
   // Commit to the user image.
   oldpagetable = p->pagetable;
   p->pagetable = pagetable;
+  uvmunmap(p->k_pagetable, 0, PGROUNDDOWN(p->sz)/PGSIZE, 0);
+  //处理同步
+  sync_pagetable(pagetable, p->k_pagetable, 0, sz);
   p->sz = sz;
   p->trapframe->epc = elf.entry;  // initial program counter = main
   p->trapframe->sp = sp;          // initial stack pointer
   proc_freepagetable(oldpagetable, oldsz);
 
+  if(p->pid==1)//题目要求
+    vmprint(p->pagetable);
   return argc;  // this ends up in a0, the first argument to main(argc, argv)
 
 bad:

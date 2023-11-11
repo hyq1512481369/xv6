@@ -5,6 +5,8 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
+#include "spinlock.h"
+#include "proc.h"
 
 /*
  * the kernel's page table.
@@ -316,6 +318,7 @@ int copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len) {
 // Copy len bytes to dst from virtual address srcva in a given page table.
 // Return 0 on success, -1 on error.
 int copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len) {
+  /*
   uint64 n, va0, pa0;
 
   while (len > 0) {
@@ -331,6 +334,8 @@ int copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len) {
     srcva = va0 + PGSIZE;
   }
   return 0;
+  */
+  return copyin_new(pagetable, dst, srcva, len);
 }
 
 // Copy a null-terminated string from user to kernel.
@@ -338,7 +343,9 @@ int copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len) {
 // until a '\0', or max.
 // Return 0 on success, -1 on error.
 int copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max) {
-  uint64 n, va0, pa0;
+ return copyinstr_new(pagetable, dst, srcva, max);
+ /* 
+ uint64 n, va0, pa0;
   int got_null = 0;
 
   while (got_null == 0 && max > 0) {
@@ -370,6 +377,7 @@ int copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max) {
   } else {
     return -1;
   }
+  */
 }
 
 // check if use global kpgtbl or not
@@ -378,4 +386,87 @@ int test_pagetable() {
   uint64 gsatp = MAKE_SATP(kernel_pagetable);
   printf("test_pagetable: %d\n", satp != gsatp);
   return satp != gsatp;
+}
+
+void fmtprint(pagetable_t pagetable,int level,uint64 va){
+  va=va<<9;
+  if(pagetable==0) return;
+  for(int i = 0; i < 512; i++){
+    va=((va>>9)<<9)+i;
+    if(pagetable[i]==0) continue;
+    pte_t pte = pagetable[i];
+    if(pte & PTE_V){
+      uint64 pa = PTE2PA(pte);
+      if((pte & (PTE_R|PTE_W|PTE_X))!=0)
+        level=0;
+      switch (level)
+      {
+      case 2:
+        printf("||idx: %d: pa: %p, flags: ----\n",i,pa);
+        fmtprint((pagetable_t)pa,level-1,va);
+        break;
+      case 1:
+        printf("|| ||idx: %d: pa: %p, flags: ----\n",i,pa);
+        fmtprint((pagetable_t)pa,level-1,va);
+        break;
+      case 0:
+        {
+        char *r=(pte&PTE_R)?"r":"-";
+        char *w=(pte&PTE_W)?"w":"-";
+        char *x=(pte&PTE_X)?"x":"-";
+        char *u=(pte&PTE_U)?"u":"-";
+        printf("|| || ||idx: %d: va: %p -> pa: %p, flags: %s%s%s%s\n",i,(va<<12)+(pa&0xfff),pa,r,w,x,u);
+        }
+      }
+    }
+  }
+}
+
+void vmprint(pagetable_t pagetable){
+  printf("page table %p\n",pagetable);
+  fmtprint(pagetable,2,0);
+}
+
+pagetable_t one_kvminit() {
+  pagetable_t one = (pagetable_t)kalloc();
+  memset(one, 0, PGSIZE);
+  // uart registers
+  one_kvmmap(one,UART0, UART0, PGSIZE, PTE_R | PTE_W);
+  // virtio mmio disk interface
+  one_kvmmap(one,VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
+  // CLINT
+  //one_kvmmap(one,CLINT, CLINT, 0x10000, PTE_R | PTE_W);
+  // PLIC
+  one_kvmmap(one,PLIC, PLIC, 0x400000, PTE_R | PTE_W);
+  // map kernel text executable and read-only.
+  one_kvmmap(one,KERNBASE, KERNBASE, (uint64)etext - KERNBASE, PTE_R | PTE_X);
+  // map kernel data and the physical RAM we'll make use of.
+  one_kvmmap(one,(uint64)etext, (uint64)etext, PHYSTOP - (uint64)etext, PTE_R | PTE_W);
+  // map the trampoline for trap entry/exit to
+  // the highest virtual address in the kernel.
+  one_kvmmap(one,TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
+  return one;
+}
+void one_kvmmap(pagetable_t one,uint64 va, uint64 pa, uint64 sz, int perm) {
+  if (mappages(one, va, sz, pa, perm) != 0) panic("kvmmap");
+}
+
+
+
+
+int sync_pagetable(pagetable_t user, pagetable_t kernel, uint64 start, uint64 end){
+  pte_t *pte, *newPte;
+  uint Myflag;
+    uint64 pa;
+  for(uint64 i = PGROUNDDOWN(start); i < end; i += PGSIZE){
+    if((pte = walk(user, i, 0)) == 0)
+      panic("not exist");
+    if((newPte = walk(kernel, i, 1)) == 0)
+      panic("not present");    
+    //获取flag的值,但是不要U
+    Myflag = PTE_FLAGS(*pte) & (~PTE_U);
+    pa = PTE2PA(*pte);
+    *newPte = PA2PTE(pa) | Myflag;
+  }
+  return 0;
 }
