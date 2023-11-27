@@ -5,6 +5,12 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "fcntl.h"
+#include "fs.h"
+#include "sleeplock.h"
+#include "file.h"
+#define max(a, b) ((a) > (b) ? (a) : (b))
+#define min(a, b) ((a) < (b) ? (a) : (b))
 
 struct cpu cpus[NCPU];
 
@@ -296,6 +302,15 @@ fork(void)
       np->ofile[i] = filedup(p->ofile[i]);
   np->cwd = idup(p->cwd);
 
+   //mine 复制vma
+  for (i = 0; i < NVMA; ++i) {
+    if (p->vma[i].addr) {
+      np->vma[i] = p->vma[i];
+      filedup(np->vma[i].f);
+    }
+  }
+
+
   safestrcpy(np->name, p->name, sizeof(p->name));
 
   pid = np->pid;
@@ -343,6 +358,42 @@ exit(int status)
 
   if(p == initproc)
     panic("init exiting");
+
+   // 取消映射
+  for (int i = 0; i < NVMA; ++i) {
+    if (p->vma[i].addr == 0) {
+      continue;
+    }
+    uint maxsz = ((MAXOPBLOCKS - 1 - 1 - 2) / 2) * BSIZE;
+   struct vm *vma = &p->vma[i];
+    if ((vma->flag & MAP_SHARED)) {
+      for (uint64 va = vma->addr; va < vma->addr + vma->len; va += PGSIZE) {
+        if (uvmgetdirty(p->pagetable, va) == 0) { continue;}
+        uint n1;
+        uint n = min(PGSIZE, vma->addr + vma->len - va);
+        for (int r = 0; r < n; r += n1) {
+          n1 = min(maxsz, n - i);
+          begin_op();
+          ilock(vma->f->ip);
+          if (writei(vma->f->ip, 1, va + i, va - vma->addr + vma->offset + i, n1) != n1) {
+            iunlock(vma->f->ip);
+            end_op();
+            panic("exit: writei failed");
+          }
+          iunlock(vma->f->ip);
+          end_op();
+        }
+      }
+    }
+    uvmunmap(p->pagetable, vma->addr, (vma->len - 1) / PGSIZE + 1, 1);
+    vma->addr = 0;
+    vma->len = 0;
+    vma->offset = 0;
+    vma->flag = 0;
+    vma->offset = 0;
+    fileclose(vma->f);
+    vma->f = 0;
+  }
 
   // Close all open files.
   for(int fd = 0; fd < NOFILE; fd++){

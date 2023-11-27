@@ -1,0 +1,484 @@
+diff --git a/Makefile b/Makefile
+index d8509b1..31803d4 100644
+--- a/Makefile
++++ b/Makefile
+@@ -175,6 +175,7 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
++	$U/_mmaptest\
+ 
+ 
+ 
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 41098f4..a4fd28c 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -8,6 +8,7 @@ struct spinlock;
+ struct sleeplock;
+ struct stat;
+ struct superblock;
++struct vm;
+ 
+ // bio.c
+ void            binit(void);
+@@ -171,6 +172,8 @@ uint64          walkaddr(pagetable_t, uint64);
+ int             copyout(pagetable_t, uint64, char *, uint64);
+ int             copyin(pagetable_t, char *, uint64, uint64);
+ int             copyinstr(pagetable_t, char *, uint64, uint64);
++int             uvmgetdirty(pagetable_t, uint64);
++int             uvmsetdirtywrite(pagetable_t , uint64 );
+ 
+ // plic.c
+ void            plicinit(void);
+diff --git a/kernel/memlayout.h b/kernel/memlayout.h
+index 776f98c..550ba0a 100644
+--- a/kernel/memlayout.h
++++ b/kernel/memlayout.h
+@@ -65,3 +65,6 @@
+ //   TRAPFRAME (p->trapframe, used by the trampoline)
+ //   TRAMPOLINE (the same page as in the kernel)
+ #define TRAPFRAME (TRAMPOLINE - PGSIZE)
++
++// mine，最小地址 
++#define MMAPMINADDR (TRAPFRAME - 10 * PGSIZE)
+\ No newline at end of file
+diff --git a/kernel/proc.c b/kernel/proc.c
+index ba1a9e3..15a6efe 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -5,6 +5,12 @@
+ #include "spinlock.h"
+ #include "proc.h"
+ #include "defs.h"
++#include "fcntl.h"
++#include "fs.h"
++#include "sleeplock.h"
++#include "file.h"
++#define max(a, b) ((a) > (b) ? (a) : (b))
++#define min(a, b) ((a) < (b) ? (a) : (b))
+ 
+ struct cpu cpus[NCPU];
+ 
+@@ -296,6 +302,15 @@ fork(void)
+       np->ofile[i] = filedup(p->ofile[i]);
+   np->cwd = idup(p->cwd);
+ 
++   //mine 复制vma
++  for (i = 0; i < NVMA; ++i) {
++    if (p->vma[i].addr) {
++      np->vma[i] = p->vma[i];
++      filedup(np->vma[i].f);
++    }
++  }
++
++
+   safestrcpy(np->name, p->name, sizeof(p->name));
+ 
+   pid = np->pid;
+@@ -344,6 +359,42 @@ exit(int status)
+   if(p == initproc)
+     panic("init exiting");
+ 
++   // 取消映射
++  for (int i = 0; i < NVMA; ++i) {
++    if (p->vma[i].addr == 0) {
++      continue;
++    }
++    uint maxsz = ((MAXOPBLOCKS - 1 - 1 - 2) / 2) * BSIZE;
++   struct vm *vma = &p->vma[i];
++    if ((vma->flag & MAP_SHARED)) {
++      for (uint64 va = vma->addr; va < vma->addr + vma->len; va += PGSIZE) {
++        if (uvmgetdirty(p->pagetable, va) == 0) { continue;}
++        uint n1;
++        uint n = min(PGSIZE, vma->addr + vma->len - va);
++        for (int r = 0; r < n; r += n1) {
++          n1 = min(maxsz, n - i);
++          begin_op();
++          ilock(vma->f->ip);
++          if (writei(vma->f->ip, 1, va + i, va - vma->addr + vma->offset + i, n1) != n1) {
++            iunlock(vma->f->ip);
++            end_op();
++            panic("exit: writei failed");
++          }
++          iunlock(vma->f->ip);
++          end_op();
++        }
++      }
++    }
++    uvmunmap(p->pagetable, vma->addr, (vma->len - 1) / PGSIZE + 1, 1);
++    vma->addr = 0;
++    vma->len = 0;
++    vma->offset = 0;
++    vma->flag = 0;
++    vma->offset = 0;
++    fileclose(vma->f);
++    vma->f = 0;
++  }
++
+   // Close all open files.
+   for(int fd = 0; fd < NOFILE; fd++){
+     if(p->ofile[fd]){
+diff --git a/kernel/proc.h b/kernel/proc.h
+index 9c16ea7..201dc0c 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -81,6 +81,18 @@ struct trapframe {
+ };
+ 
+ enum procstate { UNUSED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
++#define NVMA 16 //最大长度
++
++//vm结构体
++struct vm {
++    uint64 addr;    //地址
++    int len;    //长度  
++    int flag;
++    int prot;  //permission
++    int offset; 
++    struct file* f;     // 文件指针
++};
++
+ 
+ // Per-process state
+ struct proc {
+@@ -103,4 +115,5 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  struct vm vma[NVMA];  //mine
+ };
+diff --git a/kernel/riscv.h b/kernel/riscv.h
+index 0aec003..acd2af2 100644
+--- a/kernel/riscv.h
++++ b/kernel/riscv.h
+@@ -352,3 +352,5 @@ sfence_vma()
+ 
+ typedef uint64 pte_t;
+ typedef uint64 *pagetable_t; // 512 PTEs
++
++#define PTE_D (1L << 7) //mine，脏页
+\ No newline at end of file
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index c1b3670..7320633 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -104,6 +104,8 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_wait(void);
+ extern uint64 sys_write(void);
+ extern uint64 sys_uptime(void);
++extern uint64 sys_mmap(void);
++extern uint64 sys_munmap(void);
+ 
+ static uint64 (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -127,6 +129,8 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_mmap]    sys_mmap,
++[SYS_munmap]  sys_munmap,
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..e7b18d6 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,5 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_mmap   22
++#define SYS_munmap 23
+diff --git a/kernel/sysfile.c b/kernel/sysfile.c
+index 5dc453b..0fab923 100644
+--- a/kernel/sysfile.c
++++ b/kernel/sysfile.c
+@@ -15,6 +15,9 @@
+ #include "sleeplock.h"
+ #include "file.h"
+ #include "fcntl.h"
++#include "memlayout.h"
++#define max(a, b) ((a) > (b) ? (a) : (b))
++#define min(a, b) ((a) < (b) ? (a) : (b))
+ 
+ // Fetch the nth word-sized system call argument as a file descriptor
+ // and return both the descriptor and the corresponding struct file.
+@@ -484,3 +487,138 @@ sys_pipe(void)
+   }
+   return 0;
+ }
++
++//mine
++uint64 sys_mmap(void) {
++  uint64 addr;
++  int len, prot, flags, offset;
++  struct file *f;
++  struct vm *vma = 0;
++  struct proc *p = myproc();
++  int i;
++  //读入数据的逻辑
++  if (argaddr(0, &addr) < 0 || argint(1, &len) < 0
++      || argint(2, &prot) < 0 || argint(3, &flags) < 0
++      || argfd(4, 0, &f) < 0 || argint(5, &offset) < 0) {
++    return -1;
++  }
++  //flag不符合要求就停止
++  if (flags != MAP_SHARED && flags != MAP_PRIVATE) {
++    return -1;
++  }
++  // MAP_SHARED时必须写入
++  if (flags == MAP_SHARED && f->writable == 0 && (prot & PROT_WRITE)) {
++    return -1;
++  }
++  //数据要求
++  if (len < 0 || offset < 0 || offset % PGSIZE) {
++    return -1;
++  }
++  // 分配内存
++  for (i = 0; i < NVMA; ++i) {
++    if (!p->vma[i].addr) {
++      vma = &p->vma[i];
++      break;
++    }
++  }
++  if (!vma) {
++    return -1;
++  }
++
++
++  addr = MMAPMINADDR;
++  for (i = 0; i < NVMA; ++i) {
++    if (p->vma[i].addr) {
++      //找最大地址
++      addr = max(addr, p->vma[i].addr + p->vma[i].len);
++    }
++  }
++  addr = PGROUNDUP(addr);
++  if (addr + len > TRAPFRAME) {
++    return -1;
++  }
++  vma->addr = addr;   
++  vma->len = len;
++  vma->prot = prot;
++  vma->flag = flags;
++  vma->offset = offset;
++  vma->f = f;
++  filedup(f);    
++
++  return addr;
++}
++
++// mine
++uint64 sys_munmap(void) {
++  uint64 addr, va;
++  int len;
++  struct proc *p = myproc();
++  struct vm *vma = 0;
++  int i;
++  uint maxsz, n, n1;
++  if (argaddr(0, &addr) < 0 || argint(1, &len) < 0) {
++    return -1;
++  }
++  if (addr % PGSIZE || len < 0) {
++    return -1;
++  }
++
++  //找vma
++  for (i = 0; i < NVMA; ++i) {
++    if (p->vma[i].addr && addr >= p->vma[i].addr && addr + len <= p->vma[i].addr + p->vma[i].len) {
++      vma = &p->vma[i];
++      break;
++    }
++  }
++  if (!vma) {
++    return -1;
++  }
++
++  if (len == 0) {
++    return 0;
++  }
++
++  if ((vma->flag & MAP_SHARED)) {
++    //最大的大小
++    maxsz = ((MAXOPBLOCKS - 1 - 1 - 2) / 2) * BSIZE;
++    for (va = addr; va < addr + len; va += PGSIZE) {
++      if (uvmgetdirty(p->pagetable, va) == 0) {
++        continue;
++      }
++      // 回写脏页
++      n = min(PGSIZE, addr + len - va);
++      for (i = 0; i < n; i += n1) {
++        n1 = min(maxsz, n - i);
++        begin_op();
++        ilock(vma->f->ip);
++        if (writei(vma->f->ip, 1, va + i, va - vma->addr + vma->offset + i, n1) != n1) {
++          iunlock(vma->f->ip);
++          end_op();
++          return -1;
++        }
++        iunlock(vma->f->ip);
++        end_op();
++      }
++    }
++  }
++  uvmunmap(p->pagetable, addr, (len - 1) / PGSIZE + 1, 1);
++  //更新
++  if (addr == vma->addr && len == vma->len) {
++    vma->addr = 0;
++    vma->len = 0;
++    vma->offset = 0;
++    vma->flag = 0;
++    vma->prot = 0;
++    fileclose(vma->f);
++    vma->f = 0;
++  } else if (addr == vma->addr) {
++    vma->addr += len;
++    vma->offset += len;
++    vma->len -= len;
++  } else if (addr + len == vma->addr + vma->len) {
++    vma->len -= len;
++  } else {
++    panic("unexpected munmap");
++  }
++  return 0;
++}
+\ No newline at end of file
+diff --git a/kernel/trap.c b/kernel/trap.c
+index a63249e..fd30e15 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -5,6 +5,10 @@
+ #include "spinlock.h"
+ #include "proc.h"
+ #include "defs.h"
++#include "fs.h"
++#include "fcntl.h"
++#include "sleeplock.h"
++#include "file.h"
+ 
+ struct spinlock tickslock;
+ uint ticks;
+@@ -65,9 +69,60 @@ usertrap(void)
+     intr_on();
+ 
+     syscall();
++
++  }else if (r_scause() == 12 || r_scause() == 13
++          || r_scause() == 15) { // mine ，mmap错误处理
++    char *pa;
++    uint64 va = PGROUNDDOWN(r_stval());
++    struct vm *vma = 0;
++    int flags = PTE_U;
++    int i;
++    // 找vma
++    for (i = 0; i < NVMA; ++i) {
++      if (p->vma[i].addr && va >= p->vma[i].addr
++          && va < p->vma[i].addr + p->vma[i].len) {
++        vma = &p->vma[i];
++        break;
++      }
++    }
++    if (!vma) {
++      goto err;
++    }
++    // 设置flag
++    if (r_scause() == 15 && (vma->prot & PROT_WRITE)
++        && walkaddr(p->pagetable, va)) {
++      if (uvmsetdirtywrite(p->pagetable, va)) {
++        goto err;
++      }
++    } else {
++      if ((pa = kalloc()) == 0) {
++        goto err;
++      }
++      memset(pa, 0, PGSIZE);
++      ilock(vma->f->ip);
++      if (readi(vma->f->ip, 0, (uint64) pa, va - vma->addr + vma->offset, PGSIZE) < 0) {
++        iunlock(vma->f->ip);
++        goto err;
++      }
++      iunlock(vma->f->ip);
++      if ((vma->prot & PROT_READ)) {
++        flags |= PTE_R;
++      }
++      if (r_scause() == 15 && (vma->prot & PROT_WRITE)) {
++        flags |= PTE_W | PTE_D;
++      }
++      if ((vma->prot & PROT_EXEC)) {
++        flags |= PTE_X;
++      }
++      if (mappages(p->pagetable, va, PGSIZE, (uint64) pa, flags) != 0) {
++        kfree(pa);
++        goto err;
++      }
++    }
+   } else if((which_dev = devintr()) != 0){
+     // ok
+   } else {
++err:    
+     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
+     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
+     p->killed = 1;
+diff --git a/kernel/vm.c b/kernel/vm.c
+index b47f111..ec39dc3 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -172,9 +172,11 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
+     if((pte = walk(pagetable, a, 0)) == 0)
+       panic("uvmunmap: walk");
+     if((*pte & PTE_V) == 0)
+-      panic("uvmunmap: not mapped");
++      continue;
++      //panic("uvmunmap: not mapped");
+     if(PTE_FLAGS(*pte) == PTE_V)
+-      panic("uvmunmap: not a leaf");
++      continue;
++      //panic("uvmunmap: not a leaf");
+     if(do_free){
+       uint64 pa = PTE2PA(*pte);
+       kfree((void*)pa);
+@@ -429,3 +431,21 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
+     return -1;
+   }
+ }
++//脏页get
++int uvmgetdirty(pagetable_t pagetable, uint64 va) {
++  pte_t *pte = walk(pagetable, va, 0);
++  if(pte == 0) {
++    return 0;
++  }
++  return (*pte & PTE_D);
++}
++
++// 脏页设置
++int uvmsetdirtywrite(pagetable_t pagetable, uint64 va) {
++  pte_t *pte = walk(pagetable, va, 0);
++  if(pte == 0) {
++    return -1;
++  }
++  *pte |= PTE_D | PTE_W;
++  return 0;
++}
+\ No newline at end of file
+diff --git a/user/user.h b/user/user.h
+index b71ecda..8211936 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -40,3 +40,5 @@ void free(void*);
+ int atoi(const char*);
+ int memcmp(const void *, const void *, uint);
+ void *memcpy(void *, const void *, uint);
++void *mmap(void * , int , int , int , int , int);  //mine
++int munmap(void * , int);//mine
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..d23b9cc 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,5 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("mmap");
++entry("munmap");
