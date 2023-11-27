@@ -283,6 +283,43 @@ create(char *path, short type, short major, short minor)
   return ip;
 }
 
+static struct inode* follow_symlink(struct inode* ip) {
+  uint inums[MAXLINK];
+  int i, j;
+  char target[MAXPATH];
+
+  for(i = 0; i < MAXLINK; i++) {
+    inums[i] = ip->inum;
+    // 读文件
+    if(readi(ip, 0, (uint64)target, 0, MAXPATH) <= 0) {
+      iunlockput(ip);
+      printf("open_symlink: open symlink failed\n");
+      return 0;
+    }
+    iunlockput(ip);
+    
+    // 找inode
+    if((ip = namei(target)) == 0) {
+      printf("open_symlink: path \"%s\" not exist\n", target);
+      return 0;
+    }
+    for(j = 0; j <= i; ++j) {
+      if(ip->inum == inums[j]) {
+        printf("open_symlink: links  cycle\n");
+        return 0;
+      }
+    }
+    ilock(ip);
+    if(ip->type != T_SYMLINK) {
+      return ip;
+    }
+  }
+
+  iunlockput(ip);
+  printf("open_symlink: depth  limited\n");
+  return 0;
+}
+
 uint64
 sys_open(void)
 {
@@ -320,6 +357,15 @@ sys_open(void)
     iunlockput(ip);
     end_op();
     return -1;
+  }
+  // mine
+  if(ip->type == T_SYMLINK && (omode & O_NOFOLLOW) == 0) {
+    if((ip = follow_symlink(ip)) == 0) {
+      // 此处好像不用释放锁,注释掉了
+      //iunlockput(ip);
+      end_op();
+      return -1;
+    }
   }
 
   if((f = filealloc()) == 0 || (fd = fdalloc(f)) < 0){
@@ -484,3 +530,33 @@ sys_pipe(void)
   }
   return 0;
 }
+
+
+uint64 sys_symlink(void) {
+  int n;
+  char target[MAXPATH];
+  struct inode *node;
+  char path[MAXPATH];
+
+  if ((n = argstr(0, target, MAXPATH)) < 0 || argstr(1, path, MAXPATH) < 0) {
+    return -1;
+  }
+  begin_op();
+  //创建inode
+  if((node = create(path, T_SYMLINK, 0, 0)) == 0) {
+      end_op();
+      return -1;
+  }
+  //写target
+  if(writei(node, 0, (uint64)target, 0, n) != n) {
+    iunlockput(node);
+    end_op();
+    return -1;
+  }
+  iunlockput(node);
+  end_op();
+  return 0;
+}
+
+
+
