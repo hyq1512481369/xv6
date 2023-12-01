@@ -26,11 +26,16 @@ static void
 barrier()
 {
   // YOUR CODE HERE
-  //
-  // Block until all threads have called barrier() and
-  // then increment bstate.round.
-  //
-  
+  pthread_mutex_lock(&bstate.barrier_mutex);
+  //判断是否到barrier
+  if(++bstate.nthread != nthread)  {    // 没全到 
+    pthread_cond_wait(&bstate.barrier_cond,&bstate.barrier_mutex);  // wait other threads
+  } else {  // 全到达
+    bstate.nthread = 0; // reset nthread
+    ++bstate.round; // increase round
+    pthread_cond_broadcast(&bstate.barrier_cond);   // wake up all sleeping threads
+  }
+pthread_mutex_unlock(&bstate.barrier_mutex);
 }
 
 static void *
