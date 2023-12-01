@@ -1,0 +1,178 @@
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 4b9bbc0..a1dc430 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -63,6 +63,7 @@ void            ramdiskrw(struct buf*);
+ void*           kalloc(void);
+ void            kfree(void *);
+ void            kinit(void);
++int             cow_alloc(pagetable_t , uint64 ); 
+ 
+ // log.c
+ void            initlog(int, struct superblock*);
+@@ -171,6 +172,7 @@ uint64          walkaddr(pagetable_t, uint64);
+ int             copyout(pagetable_t, uint64, char *, uint64);
+ int             copyin(pagetable_t, char *, uint64, uint64);
+ int             copyinstr(pagetable_t, char *, uint64, uint64);
++pte_t *         walk(pagetable_t, uint64 , int );
+ 
+ // plic.c
+ void            plicinit(void);
+diff --git a/kernel/kalloc.c b/kernel/kalloc.c
+index fa6a0ac..f486714 100644
+--- a/kernel/kalloc.c
++++ b/kernel/kalloc.c
+@@ -8,6 +8,7 @@
+ #include "spinlock.h"
+ #include "riscv.h"
+ #include "defs.h"
++uint page_ref[(PHYSTOP - KERNBASE) / PGSIZE];
+ 
+ void freerange(void *pa_start, void *pa_end);
+ 
+@@ -46,11 +47,17 @@ freerange(void *pa_start, void *pa_end)
+ void
+ kfree(void *pa)
+ {
+-  struct run *r;
++  struct run *r;  
+ 
+   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
+     panic("kfree");
+ 
++  if(page_ref[COW_I(pa)] > 1) {
++    page_ref[COW_I(pa)]--;
++    return;
++  }
++
++  page_ref[COW_I(pa)] = 0;
+   // Fill with junk to catch dangling refs.
+   memset(pa, 1, PGSIZE);
+ 
+@@ -76,7 +83,32 @@ kalloc(void)
+     kmem.freelist = r->next;
+   release(&kmem.lock);
+ 
+-  if(r)
+-    memset((char*)r, 5, PGSIZE); // fill with junk
++  if(r) {
++    memset((char*)r, 5, PGSIZE); // 填满junk
++    page_ref[COW_I(r)] = 1;
++  }
+   return (void*)r;
+ }
++
++int
++cow_alloc(pagetable_t pagetable, uint64 va) {
++  va = PGROUNDDOWN(va);
++  if(va >= MAXVA) return -1;
++  pte_t *pte = walk(pagetable, va, 0);
++  if(pte == 0) return -1;
++  uint64 pa = PTE2PA(*pte);
++  if(pa == 0) return -1;
++  uint64 flags = PTE_FLAGS(*pte);
++  if(flags & PTE_COW) {
++    uint64 mem = (uint64)kalloc();
++    if (mem == 0) return -1;
++    memmove((char*)mem, (char*)pa, PGSIZE);
++    uvmunmap(pagetable, va, 1, 1);
++    flags = (flags | PTE_W) & ~PTE_COW;
++	if (mappages(pagetable, va, PGSIZE, mem, flags) != 0) {
++      kfree((void*)mem);
++      return -1;
++    }
++  }
++  return 0;
++}
+diff --git a/kernel/riscv.h b/kernel/riscv.h
+index 0aec003..c96b770 100644
+--- a/kernel/riscv.h
++++ b/kernel/riscv.h
+@@ -352,3 +352,6 @@ sfence_vma()
+ 
+ typedef uint64 pte_t;
+ typedef uint64 *pagetable_t; // 512 PTEs
++
++#define PTE_COW (1L << 8)  //mine pte_cow
++#define COW_I(pa) (((uint64)(pa) - KERNBASE) >> 12) //cow_index
+\ No newline at end of file
+diff --git a/kernel/trap.c b/kernel/trap.c
+index a63249e..afc50ac 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -65,7 +65,14 @@ usertrap(void)
+     intr_on();
+ 
+     syscall();
+-  } else if((which_dev = devintr()) != 0){
++  }else if(r_scause() == 15) { //代码为15的情况
++    uint64 va = r_stval();
++    if(va >= p->sz)
++      p->killed = 1;        //kill
++    else if(cow_alloc(p->pagetable, va) != 0)
++      p->killed = 1;        //kill
++  }
++  else if((which_dev = devintr()) != 0){
+     // ok
+   } else {
+     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
+diff --git a/kernel/vm.c b/kernel/vm.c
+index bccb405..8d6fd3c 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -299,6 +299,7 @@ uvmfree(pagetable_t pagetable, uint64 sz)
+   freewalk(pagetable);
+ }
+ 
++extern uint page_ref[]; 
+ // Given a parent process's page table, copy
+ // its memory into a child's page table.
+ // Copies both the page table and the
+@@ -311,7 +312,6 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+   pte_t *pte;
+   uint64 pa, i;
+   uint flags;
+-  char *mem;
+ 
+   for(i = 0; i < sz; i += PGSIZE){
+     if((pte = walk(old, i, 0)) == 0)
+@@ -319,14 +319,12 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+     if((*pte & PTE_V) == 0)
+       panic("uvmcopy: page not present");
+     pa = PTE2PA(*pte);
++    *pte = (*pte & ~PTE_W) | PTE_COW;
+     flags = PTE_FLAGS(*pte);
+-    if((mem = kalloc()) == 0)
+-      goto err;
+-    memmove(mem, (char*)pa, PGSIZE);
+-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
+-      kfree(mem);
++    if(mappages(new, i, PGSIZE, pa, flags) != 0){
+       goto err;
+     }
++    page_ref[COW_I(pa)]++;   //调用
+   }
+   return 0;
+ 
+@@ -355,15 +353,21 @@ int
+ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
+ {
+   uint64 n, va0, pa0;
++  pte_t *pte;  //建pte
+ 
+   while(len > 0){
+     va0 = PGROUNDDOWN(dstva);
++    if (cow_alloc(pagetable, va0) != 0)
++      return -1;        //错误
+     pa0 = walkaddr(pagetable, va0);
+     if(pa0 == 0)
+       return -1;
+     n = PGSIZE - (dstva - va0);
+     if(n > len)
+       n = len;
++    pte = walk(pagetable, va0, 0);    //walk
++    if(pte == 0)
++      return -1;      //错误
+     memmove((void *)(pa0 + (dstva - va0)), src, n);
+ 
+     len -= n;

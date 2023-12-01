@@ -352,3 +352,6 @@ sfence_vma()
 
 typedef uint64 pte_t;
 typedef uint64 *pagetable_t; // 512 PTEs
+
+#define PTE_COW (1L << 8)  //mine pte_cow
+#define COW_I(pa) (((uint64)(pa) - KERNBASE) >> 12) //cow_index
